@@ -2,15 +2,19 @@ package io.authme.keyczar;
 
 import android.os.Bundle;
 import android.support.v7.app.AppCompatActivity;
+import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
+import android.widget.Toast;
 
 import com.google.gson.Gson;
 
+import org.json.JSONException;
+import org.json.JSONObject;
 import org.keyczar.DefaultKeyType;
 import org.keyczar.Encrypter;
 import org.keyczar.GenericKeyczar;
@@ -20,6 +24,7 @@ import org.keyczar.SessionCrypter;
 import org.keyczar.Signer;
 import org.keyczar.enums.KeyPurpose;
 import org.keyczar.exceptions.KeyczarException;
+import org.keyczar.exceptions.NoPrimaryKeyException;
 
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -29,6 +34,7 @@ import java.util.UUID;
 
 import keyczar.JsonWriter;
 import keyczar.KeyPair;
+import keyczar.KeyczarJsonReader;
 import keyczar.Message;
 import keyczar.NewUserRequest;
 import keyczar.Request;
@@ -51,7 +57,9 @@ public class MainActivity extends AppCompatActivity {
         generate.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                generateKey_local();
+                r = new Request();
+                tryKeyczar();
+                //generateKey_local();
             }
         });
     }
@@ -222,5 +230,163 @@ public class MainActivity extends AppCompatActivity {
         }
 
         return publicKeyPair;
+    }
+
+    private void tryKeyczar() {
+        final GenericKeyczar[] mySignVerify = new GenericKeyczar[1];
+        final GenericKeyczar[] myEncryptDecrypt = new GenericKeyczar[1];
+        final GenericKeyczar[] group_signVerify = new GenericKeyczar[1];
+        final GenericKeyczar[] group_encryptDecrypt = new GenericKeyczar[1];
+        RestClient client = new RestClient(new Callback() {
+            @Override
+            public void onExecuted(String response) {
+                if (!TextUtils.equals(response, "error")) {
+                    try {
+                        JSONObject jsonresponse = new JSONObject(response);
+                        mySignVerify[0] = new GenericKeyczar(new KeyczarJsonReader(jsonresponse.getString("signing")));
+                        myEncryptDecrypt[0] = new GenericKeyczar(new KeyczarJsonReader(jsonresponse.getString("encryption")));
+                        RestClient restClient = new RestClient(new Callback() {
+                            @Override
+                            public void onExecuted(String response) {
+                                if (!TextUtils.equals(response, "error")) {
+                                    try {
+                                        JSONObject jsonresponse_2 = new JSONObject(response);
+                                        group_signVerify[0] = new GenericKeyczar(new KeyczarJsonReader(jsonresponse_2.getString("signing")));
+                                        group_encryptDecrypt[0] = new GenericKeyczar(new KeyczarJsonReader(jsonresponse_2.getString("encryption")));
+                                        encryptKeywithPassword(mySignVerify[0], myEncryptDecrypt[0], group_signVerify[0], group_encryptDecrypt[0]);
+                                    } catch (JSONException e) {
+                                        e.printStackTrace();
+                                    } catch (KeyczarException e) {
+                                        e.printStackTrace();
+                                    }
+                                }
+                            }
+                        });
+                        restClient.getKeys();
+                    } catch (KeyczarException e) {
+                        e.printStackTrace();
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                    }
+
+                }
+                else {
+                    Toast.makeText(getApplicationContext(), response, Toast.LENGTH_LONG).show();
+                }
+            }
+        });
+
+        client.getKeys();
+    }
+
+    private void encryptKeywithPassword(GenericKeyczar signkey, GenericKeyczar encryptionkey, GenericKeyczar group_signkey, GenericKeyczar group_encrptionkey){
+        KeyVersion keyVersion = null;
+        try {
+            keyVersion = signkey.getMetadata().getPrimaryVersion();
+        } catch (NoPrimaryKeyException e) {
+            e.printStackTrace();
+        }
+        String password = UUID.randomUUID().toString();
+        app.putSharedPreferences("password", password);
+
+        StringBuffer myOutputEncryptionKeyEncrypted = new StringBuffer();
+        StringBuffer myOutputEncryptionKey = new StringBuffer();
+        StringBuffer myOutputSignKeyEncrypted = new StringBuffer();
+        StringBuffer myOutputSignKey = new StringBuffer();
+        StringBuffer groupEncryptDecryptPrivatekey = new StringBuffer();
+        StringBuffer groupSignVerifyPrivatekey = new StringBuffer();
+
+        JsonWriter.writeEncrypted(encryptionkey, password, myOutputEncryptionKeyEncrypted);
+
+        JsonWriter.writeEncrypted(signkey, password, myOutputSignKeyEncrypted);
+        JsonWriter.write(encryptionkey, myOutputEncryptionKey);
+        JsonWriter.write(signkey, myOutputSignKey);
+        JsonWriter.write(group_encrptionkey, groupEncryptDecryptPrivatekey);
+        JsonWriter.write(group_signkey, groupSignVerifyPrivatekey);
+
+        Map<Integer, KeyczarKey> localMap = new HashMap<>();
+        try {
+            localMap.put(encryptionkey.getMetadata().getPrimaryVersion().getVersionNumber(), encryptionkey.getKey(encryptionkey.getMetadata().getPrimaryVersion()));
+        } catch (NoPrimaryKeyException e) {
+            e.printStackTrace();
+        }
+
+        Encrypter crypter = null;
+        try {
+            crypter = new Encrypter(new Util.MemoryKeyReader(group_encrptionkey.getMetadata(), localMap));
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+        SessionCrypter s = null;
+        try {
+            s = new SessionCrypter(crypter);
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+
+        KeyPair groupKeyPair = new KeyPair();
+        groupKeyPair.encryption = groupEncryptDecryptPrivatekey.toString();
+        groupKeyPair.signing = groupSignVerifyPrivatekey.toString();
+        byte[] groupKeyEncryptedForMe = new byte[0];
+        try {
+            groupKeyEncryptedForMe = s.encrypt(gson.toJson(groupKeyPair).getBytes());
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+        byte[] sessionMaterial = s.getSessionMaterial();
+        byte[] packed = packByteStrings(sessionMaterial, groupKeyEncryptedForMe);
+
+
+        r.groupKeyEncryptedForMe = Base64.encodeToString(packed, Base64.NO_WRAP);
+        r.analyticsId = UUID.randomUUID().toString();
+        try {
+            r.publicKey = gson.toJson(getPublicKeyPair(encryptionkey, signkey));
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+        try {
+            r.groupPublicKey = gson.toJson(getPublicKeyPair(group_encrptionkey, group_signkey));
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+
+        KeyPair myKeyPairEncrypted = new KeyPair();
+        KeyPair myKeyPair = new KeyPair();
+        myKeyPair.encryption = myOutputEncryptionKey.toString();
+        myKeyPair.signing = myOutputSignKey.toString();
+        app.putSharedPreferences("myKeyPair", gson.toJson(myKeyPair));
+
+        myKeyPairEncrypted.encryption = myOutputEncryptionKeyEncrypted.toString();
+        myKeyPairEncrypted.signing = myOutputSignKeyEncrypted.toString();
+        r.encryptedPrivateKey = gson.toJson(myKeyPairEncrypted);
+
+        Message m = new Message();
+        m.identity = r.userId;
+        m.request = gson.toJson(r);
+
+        Map<Integer, KeyczarKey> keyMap = new HashMap<>();
+        keyMap.put(keyVersion.getVersionNumber(), signkey.getKey(keyVersion));
+        Util.MemoryKeyReader reader = new Util.MemoryKeyReader(signkey.getMetadata(), keyMap);
+        Signer signer = null;
+        try {
+            signer = new Signer(reader);
+            m.signature = signer.sign(m.request);
+        } catch (KeyczarException e) {
+            e.printStackTrace();
+        }
+
+        NewUserRequest nur = new NewUserRequest();
+        app.putSharedPreferences("myEmail", r.userId);
+        app.putSharedPreferences("myPhoneNumber", phoneNumber);
+        app.putSharedPreferences("myName", finalName);
+        app.putSharedPreferences("password", password);
+        nur.Email = r.userId;
+        nur.Phone = phoneNumber;
+        nur.Name = finalName;
+        nur.XmppResource = UUID.randomUUID().toString();
+        nur.MitroSignedRequest = gson.toJson(m);
+        nur.Identifier = app.getDeviceId();
+
+        request = gson.toJson(nur);
     }
 }
